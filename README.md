@@ -1,85 +1,167 @@
-# Burp Suite extension: Android pentest (emulator + Frida)
+# Android Pentest — Burp Suite Extension
 
-A **Burp Suite** extension (Montoya API) that automates preparing an **Android** target aligned with Burp’s **proxy listener**, installs the **Burp CA** into `/system` when a `.der` file is provided, deploys **frida-server** on the device, and runs **Frida scripts** from a configurable folder.
+A [Burp Suite](https://portswigger.net/burp) extension built with the **Montoya API** that helps you prepare an **Android emulator or physical device** for web and mobile security testing: it aligns the device with Burp’s **proxy listener**, installs Burp’s **CA certificate** (when you provide a `.der` export), deploys **`frida-server`** on the device, and runs **Frida CLI** sessions with your local `.js` scripts.
 
-**Default target:** local **Android Studio AVD**. The emulator QEMU process uses `-http-proxy http://127.0.0.1:BurpPort` (host loopback). Inside the guest, **`adb reverse tcp:port tcp:port`** plus **`settings global http_proxy 127.0.0.1:port`** sends app HTTP(S) via Burp (Burp can listen on `127.0.0.1` only). Apps with **certificate pinning** or **custom stacks** may still bypass the system proxy — use Frida scripts / device tools as needed.
+**Use only on systems and applications you are authorized to test.**
 
-**Optional:** **physical device** (USB or `adb connect IP:port`) using your workstation’s **LAN IP** so the phone can reach Burp.
+---
 
-**For authorized security testing only.**
+## Table of contents
+
+1. [For PortSwigger reviewers (BApp Store)](#for-portswigger-reviewers-bapp-store)
+2. [What this extension does and does not do](#what-this-extension-does-and-does-not-do)
+3. [Architecture at a glance](#architecture-at-a-glance)
+4. [Requirements](#requirements)
+5. [Build](#build)
+6. [Install in Burp](#install-in-burp)
+7. [Quick start](#quick-start)
+8. [Connection modes](#connection-modes)
+9. [Prepare environment (pipeline)](#prepare-environment-pipeline)
+10. [Proxy port sync](#proxy-port-sync)
+11. [Burp CA and HTTPS interception](#burp-ca-and-https-interception)
+12. [Frida (host and device)](#frida-host-and-device)
+13. [Frida scripts and “List apps”](#frida-scripts-and-list-apps)
+14. [Optional APK install](#optional-apk-install)
+15. [Troubleshooting](#troubleshooting)
+16. [License and related files](#license-and-related-files)
+
+---
+
+## For PortSwigger reviewers (BApp Store)
+
+This section is written so reviewers can quickly judge scope, dependencies, and overlap with existing BApps.
+
+| Topic | Details |
+|--------|---------|
+| **API** | Montoya (`compileOnly` `montoya-api:2024.12`), Java 17. Entry: `burp.api.montoya.BurpExtension` via `META-INF/services`. |
+| **What ships in the JAR** | Extension logic only. **Not** bundled: Android SDK tools, Frida CLI, `openssl`, `xz`, system images. |
+| **Network** | First-time runs may download SDK components (`sdkmanager`) and **`frida-server`** from GitHub. The latter uses **`Http.sendRequest`** with **redirect following** (`RequestOptions` / `RedirectionMode.ALWAYS`) so Burp’s upstream proxy and TLS settings apply. |
+| **Threads / UI** | Long work runs off the Swing EDT; unload handler stops timers and Frida processes. |
+| **Differentiation from [Brida](https://portswigger.net/bappstore/2c0def96c5d44e159151b236de766892)** | Brida is a **Burp ↔ Frida bridge** (hooks, traffic integration, multi-platform). **Android Pentest** automates **lab setup**: AVD/emulator or ADB device, proxy alignment, CA installation, `frida-server` deployment, and **local Frida CLI** (`frida` / `frida-ps`). It does **not** replace Brida’s in-Burp scripting model. More wording: [BAPP_SUBMISSION.md](BAPP_SUBMISSION.md). |
+| **Submission checklist / email template** | [BAPP_SUBMISSION.md](BAPP_SUBMISSION.md), [SUBMIT_PORTSWIGGER.md](SUBMIT_PORTSWIGGER.md). Official process: [Submitting extensions to the BApp Store](https://portswigger.net/burp/documentation/desktop/extend-burp/extensions/creating/bapp-store-submitting-extensions). Acceptance criteria: [BApp Store acceptance criteria](https://portswigger.net/burp/documentation/desktop/extend-burp/extensions/creating/bapp-store-acceptance-criteria). |
+| **License** | [LICENSE](LICENSE) (MIT). |
+
+**Offline / air-gapped labs:** users must pre-install SDK images and `frida-server` manually; the extension expects normal connectivity when automated downloads are required.
+
+---
+
+## What this extension does and does not do
+
+**Does:**
+
+- Reads Burp’s **proxy listener port** from Burp settings and keeps the Android **global HTTP proxy** in sync (including a periodic refresh).
+- **Local emulator:** can create or reuse an AVD, start the emulator with `-http-proxy` toward `127.0.0.1:<BurpPort>`, use **`adb reverse`** so the guest can reach Burp on localhost.
+- **Physical device:** can `adb connect` (optional), set the device proxy to your **LAN IP** and Burp’s port.
+- Installs Burp’s CA (`.der`) for system / APEX / user stores where supported (see [Burp CA and HTTPS interception](#burp-ca-and-https-interception)).
+- Ensures **`frida-server` on the device matches the host `frida` version** (semver); downloads and pushes when needed (Unix-like hosts; Windows requires manual binary placement — see [Requirements](#requirements)).
+- Runs **`frida`** / **`frida-ps`** from the host with an extended `PATH` (macOS/Linux shells) so tools work even when Burp’s process has a minimal environment.
+
+**Does not:**
+
+- Replace Brida-style **in-Burp** Frida integration or method hooking on HTTP messages.
+- Bypass **certificate pinning** or custom HTTP stacks by itself — use your Frida scripts or other tooling.
+- Guarantee full automation on **Windows** (documented limitations).
+
+---
+
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+  subgraph burp [Burp Suite]
+    Tab[Android Pentest tab]
+    Http[Montoya Http API]
+    Prefs[Preferences]
+  end
+  subgraph host [Host OS]
+    Adb[adb / emulator / sdkmanager]
+    FridaCli[frida / frida-ps]
+    Openssl[openssl / xz]
+  end
+  subgraph device [Android device or emulator]
+    Proxy[http_proxy + optional adb reverse]
+    Ca[Burp CA in trust stores]
+    Fs[frida-server]
+  end
+  Tab --> Adb
+  Tab --> FridaCli
+  Tab --> Openssl
+  Http --> Fs
+  Adb --> device
+  FridaCli --> Fs
+```
+
+On load, the extension registers a **suite tab**, loads settings from **Preferences**, and applies Burp’s theme to the UI. On unload, it stops background timers and terminates any running Frida CLI process.
+
+---
 
 ## Requirements
 
 ### Burp Suite
 
-- **Burp Suite** with **Montoya** extension support (Burp **2022.x** or newer recommended).
-- **JDK 17+** on the workstation to build the extension (`gradle jar`).
-- A **proxy listener** configured in Burp (the extension reads the listener port from Burp’s settings).
+- Burp with **Montoya** extension support (**2022.x or newer** recommended).
+- A **Proxy listener** enabled (the extension resolves its port from Burp’s configuration).
 
-### Android Studio / Android SDK
+### Build (developers)
 
-Install **Android Studio** (or use the **standalone command-line tools** only) so that **`ANDROID_HOME`** points to a valid SDK. The extension expects at least:
+- **JDK 17+**
+- **Gradle** (project has no wrapper; use your installed `gradle`)
+
+### Android SDK (`ANDROID_HOME`)
 
 | Component | Purpose |
 |-----------|---------|
-| **Android SDK Platform-Tools** | `adb` (devices, shell, push, install certificate, `frida-server`, etc.) |
-| **Android Emulator** (optional) | QEMU binary — only required for **Local emulator** mode |
-| **Android SDK Command-line Tools** (latest) | `sdkmanager` / `avdmanager` — first-time system image download and AVD creation |
+| **Platform-Tools** | `adb` |
+| **Command-line Tools** | `sdkmanager`, `avdmanager` (create AVD / download system images) |
+| **Emulator** | QEMU binary (Android Strudio)— **only for “Local emulator” mode** |
 
-Typical paths:
+Typical locations:
 
-- **macOS:** `~/Library/Android/sdk` (Android Studio default)  
-- **Windows:** `%LOCALAPPDATA%\Android\Sdk`  
-- **Linux:** `~/Android/Sdk` (common default)
+- macOS: `~/Library/Android/sdk`
+- Windows: `%LOCALAPPDATA%\Android\Sdk`
+- Linux: `~/Android/Sdk` (common)
 
-Set **`ANDROID_HOME`** in the extension tab to that SDK root (or rely on the usual Android Studio layout).
+Set **ANDROID_HOME** in the extension UI to your SDK root.
 
-**Local emulator** mode also needs a **system image** (e.g. `system-images;android-34;google_apis;arm64-v8a` — default in the extension; matches **Apple Silicon** / **arm64** emulators). The first **Prepare environment** run may download it via `sdkmanager`.
+**System images:** the UI can list Google APIs images (e.g. `arm64-v8a` / `x86_64`). First run may download an image via `sdkmanager`. Non–Play Store “Google APIs” images are preferred for `adb root` / system CA workflows.
 
 ### Frida (host)
 
-Install the **Frida CLI** on the host machine (same machine that runs Burp):
-
-- **`frida-tools`** (Python package) provides **`frida`**, **`frida-ps`**, and matches the Frida version used to download **`frida-server`** for the device.
-
-Example:
+Install **frida-tools** so `frida` and `frida-ps` are available (same machine as Burp):
 
 ```bash
 pip install frida-tools
 # or: pipx install frida-tools
 ```
 
-Ensure `frida` and `frida-ps` resolve from a terminal. On macOS/Linux the extension runs them via a non-interactive shell with an extended `PATH` (Homebrew, `~/.local/bin`, etc.) so Burp’s GUI process can find them too.
+The extension runs `frida --version` to choose the matching **`frida-server`** build for the device.
 
 ### Host utilities (macOS / Linux)
 
-Used by the **Prepare environment** pipeline (certificate handling, downloading `frida-server`):
-
 | Tool | Role |
 |------|------|
-| **`openssl`** | Convert / hash the Burp CA (`.der`) when installing into `/system` on the device |
-| **`curl`** | Download `frida-server` from GitHub releases |
-| **`xz`** | Decompress the `.xz` `frida-server` archive |
+| **openssl** | CA conversion / hashing for installation on the device |
+| **xz** | Decompress the `.xz` `frida-server` archive after download |
+| **Burp HTTP (Montoya)** | Download `frida-server` from GitHub through Burp (follows redirects, respects Burp networking) |
 
-On **macOS**, `curl` is built-in; **`openssl`** and **`xz`** are often installed via **Homebrew** (`brew install xz openssl` if missing).
-
-On **Linux**, install the corresponding packages from your distribution (`xz-utils`, `openssl`, `curl`).
+Install missing tools via your package manager (e.g. Homebrew on macOS).
 
 ### Windows
 
-- **`adb`**, **`emulator`**, **`sdkmanager`** must be on a `PATH` visible to **`cmd.exe`** when the extension runs subprocesses.
-- Automatic download/decompression of **`frida-server`** is **not** fully supported in the pipeline; you may need to push `frida-server` manually to `/data/local/tmp/` on the device.
-- Prefer **WSL** or **macOS/Linux** for the full “one click” flow.
+- **`adb`**, **`emulator`**, **`sdkmanager`** must be on a `PATH` visible to **`cmd.exe`**.
+- Automatic **`frida-server`** download/decompression is **not** fully supported; you may need to push `frida-server` manually to `/data/local/tmp/frida-server` and match versions to the host `frida`.
+- For the full automated flow, **WSL**, **macOS**, or **Linux** are recommended.
 
 ### Physical device (optional)
 
-- **USB debugging** enabled on the phone, or **`adb connect host:port`** for wireless debugging.
-- Same network as the Burp machine when using **LAN IP** for the proxy (no `adb reverse` requirement for that path).
+- USB debugging enabled, or `adb connect host:port` for wireless ADB.
+- Phone and Burp machine on the **same network** when using **LAN IP** for the proxy.
 
-### Version / ABI notes
+### ABI note
 
-- **`frida-server`** downloaded by the pipeline targets **Android arm64** by default; other ABIs may need a **manual** binary.
-- If Burp’s **automatic listener port** detection fails, check **Proxy → Proxy settings** (listener enabled and port).
+The automated `frida-server` fetch targets **Android arm64** by default. Other ABIs may require a **manual** binary.
+
+---
 
 ## Build
 
@@ -88,133 +170,142 @@ cd burp-android-pentest
 gradle jar
 ```
 
-Output: `build/libs/android-pentest-extension-1.0.0.jar`.
+Output: `build/libs/android-pentest-extension-1.0.0.jar` (version follows `build.gradle.kts`).
+
+---
 
 ## Install in Burp
 
-1. **Extensions** → **Extensions** → **Add**.
-2. Type **Java**.
+1. **Extensions** → **Installed** → **Add**.
+2. Extension type: **Java**.
 3. Select `build/libs/android-pentest-extension-1.0.0.jar`.
-4. Open the **Android Pentest** tab.
+4. Open the **Android Pentest** suite tab.
 
-## Flow overview
+---
 
-The extension registers a **suite tab** (`Android Pentest`), persists settings via Montoya **Preferences**, reads Burp’s **proxy listener port** from exported user options, and runs subprocesses (`adb`, `emulator`, `frida`, `curl`, `xz`, `openssl`) through a **non-interactive shell** with an extended `PATH` (see Notes). On unload it stops the **proxy sync timer** and any running **Frida CLI** process.
+## Quick start
 
-### Extension lifecycle
+1. Configure a **Proxy** listener in Burp (e.g. `127.0.0.1:8080`).
+2. In **Android Pentest**, choose **Local emulator** or **Physical device** and fill **ANDROID_HOME**, optional **Burp CA (.der)** path, and **Frida scripts** folder.
+3. Click **Save settings** if you want preferences persisted.
+4. Click **Prepare environment** and watch the log (`[1/8]` … `[8/8]`).
+5. Use **List apps** to pick a package, select scripts, then **Run Frida** (Spawn or Attach).
+
+---
+
+## Connection modes
+
+| Mode | Summary |
+|------|---------|
+| **Local emulator** | Uses an AVD; emulator gets `-http-proxy http://127.0.0.1:<BurpPort>`. Guest traffic uses **`adb reverse tcp:<port> tcp:<port>`** and **`settings put global http_proxy 127.0.0.1:<port>`** so apps using the system proxy can reach Burp. |
+| **Physical device** | USB or wireless ADB. Set **Pentest machine IP** to this computer’s IPv4 on the LAN; the device proxy uses **`IP:<BurpPort>`** (no `adb reverse` for that path). |
+
+For **Frida over TCP** (`frida -H`), enable **Frida client uses network (-H)** and, on the device side, **Deploy frida-server listening on 0.0.0.0** when required.
+
+---
+
+## Prepare environment (pipeline)
+
+When you click **Prepare environment**, the extension resolves the listener port (`BurpProxyHelper`), then runs an eight-step pipeline (logged as `[1/8]` … `[8/8]`).
+
+**Local emulator only:** step `[8/8]` may **`adb reboot`** the emulator, then re-apply CA, reverse, proxy, Frida, and optionally **`adb install -r`** for your APK (tmpfs/APEX-related state is not always persistent across reboot).
+
+**Physical device:** no emulator reboot path; optional APK install runs at the end of the first pass.
+
+```mermaid
+flowchart TB
+  EP[Prepare environment]
+  EP --> S1["1/8 Host Frida version"]
+  S1 --> S2["2/8 SDK paths / adb"]
+  S2 --> M1{Local emulator?}
+  M1 -->|Yes| S3["3/8 AVD create or select"]
+  S3 --> S4["4/8 Start emulator or wait for device"]
+  M1 -->|No| S3b["3/8 Skip AVD"]
+  S3b --> S4b["4/8 adb connect if needed; wait for boot"]
+  S4 --> S5["5/8 Burp CA install"]
+  S4b --> S5
+  S5 --> S6["6/8 frida-server match host version"]
+  S6 --> S7["7/8 Proxy + reverse if emulator"]
+  S7 --> S8["8/8 Reboot path or APK install"]
+```
 
 ```mermaid
 flowchart LR
-  subgraph load["On load"]
-    JAR[JAR loaded]
-    S[SettingsStore from Preferences]
-    T[Android Pentest tab UI]
-    JAR --> S --> T
+  subgraph load [Extension load]
+    JAR[JAR]
+    P[Preferences]
+    T[Suite tab UI]
+    JAR --> P --> T
   end
-  subgraph unload["On unload"]
-    X[Extension removed]
-    TM[stopBackgroundTimers]
-    FK[FridaLauncher.stop]
-    X --> TM --> FK
-  end
-```
-
-### Prepare environment (`EmulatorPipeline.run`)
-
-When you click **Prepare environment**, the tab resolves the listener port with **`BurpProxyHelper.resolveListenerPort`**, then runs the pipeline below (logged as `[1/7]` … `[7/7]`).
-
-```mermaid
-flowchart TB
-  subgraph entry["Entry"]
-    BP[Burp listener port from Burp settings JSON]
-    EP[EmulatorPipeline.run]
-    BP --> EP
-  end
-  EP --> S1["1/7 Host: frida --version → pick frida-server release"]
-  S1 --> S2["2/7 Resolve adb + ANDROID_HOME in env"]
-  S2 --> M1{Local emulator?}
-  M1 -->|Yes| S3a["3/7 AVD: create via sdkmanager/avdmanager if missing"]
-  S3a --> S4a["4/7 Start QEMU with -http-proxy http://127.0.0.1:port OR device already online; wait boot"]
-  M1 -->|No| S3b["3/7 AVD/emulator skipped"]
-  S3b --> S4b["4/7 Optional adb connect wireless; require device + wait boot"]
-  S4a --> S5
-  S4b --> S5
-  S5["5/7 adb root + install Burp CA .der into /system if path set"]
-  S5 --> S6["6/7 frida-server: download arm64 if needed curl/xz, adb push, chmod, start"]
-  S6 --> M2{Local emulator?}
-  M2 -->|Yes| S7a["7/7 adb reverse tcp:port + settings global http_proxy 127.0.0.1:port + private_dns off"]
-  M2 -->|No| S7b["7/7 settings global http_proxy LAN_IP:port + private_dns off"]
-```
-
-### Background Burp proxy sync (tab timer)
-
-Every **15 seconds**, if `adb devices` shows a device, the tab reapplies the **same** `http_proxy` logic so a **Burp listener port change** is reflected on the device without re-running the full pipeline. For **local emulator** it also runs **`adb reverse tcp:port tcp:port`** before setting `http_proxy`.
-
-```mermaid
-flowchart TB
-  TM[Timer 15s] --> ADB{adb: device present?}
-  ADB -->|No| IDLE[Skip until next tick]
-  ADB -->|Yes| PORT[Resolve Burp port again]
-  PORT --> MODE{Local emulator?}
-  MODE -->|Yes| REV[adb reverse tcp:port]
-  REV --> HTTP[settings put global http_proxy]
-  MODE -->|No| HTTP2[settings put global http_proxy LAN:port]
-```
-
-### List apps and Run Frida (CLI)
-
-```mermaid
-flowchart TB
-  subgraph list["List apps"]
-    L1[List apps button]
-    L2["frida-ps -Uai or frida-ps -H host:port -ai"]
-    L3[Dialog: Apps tab parsed table + Raw tab full output]
-    L1 --> L2 --> L3
-  end
-  subgraph run["Run Frida"]
-    R1[Select .js scripts + package + Spawn or Attach]
-    R2["frida -U … OR frida -H … with multiple -l script.js"]
-    R3[Stdout/stderr → Frida log area]
-    R1 --> R2 --> R3
+  subgraph unload [Extension unload]
+    U[Unload]
+    TM[Stop timers]
+    F[Stop Frida CLI]
+    U --> TM --> F
   end
 ```
 
-**Physical device + Frida over TCP:** when **Frida client uses network (-H)** is enabled, **List apps** / **Run Frida** use **`-H host:port`** and the pipeline can deploy **frida-server** listening on **0.0.0.0** if that option is checked.
+---
 
-## Target connection
+## Proxy port sync
 
-| Mode | Use case |
-|------|----------|
-| **Local emulator** | AVD; `-http-proxy` to host `127.0.0.1:BurpPort`; guest uses `adb reverse` + `http_proxy 127.0.0.1:BurpPort`. |
-| **Physical device** | USB debugging or **ADB wireless** (`adb connect host:port`). Set **Pentest machine IP** to this computer’s IPv4 on the same network as the phone (the device HTTP proxy will use `IP:BurpPort`). |
+Every **15 seconds**, if `adb devices` shows a device, the extension re-applies the same **`http_proxy`** logic so if you **change Burp’s listener port**, the device catches up without re-running the full pipeline. For **local emulator**, it also runs **`adb reverse tcp:<port> tcp:<port>`** before setting the proxy.
 
-**Prepare environment** still deploys the Burp CA (if configured) and **frida-server** over ADB for both modes.
+---
 
-For **Frida over TCP** from the PC (`frida -H`), enable **Deploy frida-server listening on 0.0.0.0** and set **Frida client uses network (-H)** with the **device’s IP** and port (default 27042). The **List apps** / **Run Frida** actions use `-U` (ADB) or `-H` accordingly.
+## Burp CA and HTTPS interception
 
-## Burp CA certificate
+1. Export Burp’s CA as **DER** (**Proxy** → import/export CA certificate) and set the path in the UI.
 
-Export the CA as **DER** from Burp (Proxy → Import / export CA certificate) and set the path under **Burp CA certificate (.der)**.
+2. **Android 14 (API 34) and newer** often load default CAs from the **Conscrypt** module under paths such as **`/apex/com.android.conscrypt/cacerts`**. Installing only into **`/system/etc/security/cacerts`** may be insufficient. The extension attempts a **tmpfs overlay** and **bind-mount** approach for Conscrypt paths after `adb root`, with fallbacks documented in code and logs.
 
-## Frida scripts
+3. The pipeline may also install user-store copies so **Settings → Security → Trusted credentials → User** can show entries; a **reboot** on the emulator may be needed for the UI to reflect changes — the post-reboot phase re-applies proxy and Frida because tmpfs mounts do not survive reboot.
 
-Point the **Frida scripts folder** at your `Scripts/` directory (next to the JAR or any absolute path). The extension lists every `*.js` file as **checkboxes** so you can select **one or more** scripts; they are passed to Frida as multiple `-l` options in alphabetical order.
+4. **Chrome** and some apps may still behave differently (e.g. certificate transparency). Many apps using the platform TLS stack work once the CA is trusted.
 
-Use **List apps** to open a table of installed apps (`frida-ps -Uai` or `frida-ps -H host:port -ai`). **Double-click** a row to set **Package / target**; then **Run Frida**.
+5. Apps that **ignore the global HTTP proxy** (e.g. OkHttp defaults) may need Frida hooks or other routing; Burp will not see that traffic until it is redirected.
 
-## Suggested workflow
+---
 
-1. Configure Burp’s proxy listener (often port 8080).
-2. Choose **Local emulator** or **Physical device** and fill the relevant fields.
-3. Set **ANDROID_HOME**, the `.der` path, and the **Frida scripts folder**.
-4. Click **Prepare environment** (local mode may download the system image and create the AVD).
-5. When the device is ready, select script(s), set the package (optionally use **List apps** — double-click a row to fill **Package / target**), choose **Spawn** or **Attach**, then **Run Frida**.
+## Frida (host and device)
 
-The extension reads Burp’s **proxy listener port** from Burp’s settings and keeps the device `http_proxy` aligned (periodic sync; change the listener in Burp and the device updates without a manual port field).
+- **Version match:** the extension compares the host `frida --version` (semver) with `/data/local/tmp/frida-server --version` on the device. If they differ, it stops a running `frida-server` when necessary, downloads the matching **arm64** build via **Burp’s HTTP API** (redirects enabled), decompresses with **`xz`**, pushes to `/data/local/tmp/frida-server`, and verifies the version again before starting the server.
+- **Windows:** if versions do not match, you must place the correct binary manually (error messages explain this).
 
-## Notes
+---
 
-- **PATH / `frida-ps` / `curl` / `xz` not found from Burp**: Burp is a GUI app and often starts with a minimal `PATH`. The extension runs those tools through **`zsh -fc` / `bash -c`** with a widened `PATH` (Homebrew, `~/.local/bin`, etc.) **without** loading interactive dotfiles (avoids oh-my-zsh / gitstatus noise). On Windows, tools must be on the PATH visible to `cmd.exe /c`.
-- **Windows**: automatic `frida-server` download/decompression may require manual steps; the pipeline is mainly tested on macOS/Linux.
-- If automatic Burp port detection fails, check **Proxy → Proxy settings** (listener enabled and port).
-- The bundled `frida-server` download targets **arm64**; physical devices with a different ABI may need a manual binary.
+## Frida scripts and “List apps”
+
+- Set **Frida scripts folder** to a directory containing `*.js` files. Each file appears as a checkbox; selected scripts are passed as multiple **`-l`** arguments in **alphabetical order**.
+- **List apps** runs **`frida-ps -Uai`** or **`frida-ps -H host:port -ai`** and shows a dialog (table + raw output). **Double-click** a row to fill **Package / target**.
+- **Run Frida** invokes the **`frida`** CLI with **Spawn** or **Attach** and streams stdout/stderr into the tab. A one-line **REPL** field can send JavaScript to the process stdin when supported.
+
+---
+
+## Optional APK install
+
+Set **APK to install** (or browse) to run **`adb install -r`** after the pipeline stabilizes (after reboot on emulator, or at end of first pass on a physical device). Leave empty to skip.
+
+---
+
+## Troubleshooting
+
+| Symptom | What to check |
+|---------|----------------|
+| **Tools not found** (`frida`, `xz`, `openssl`) | Burp’s process may have a minimal `PATH`. On macOS/Linux the extension widens `PATH` via shell; install tools in standard locations (Homebrew, `~/.local/bin`). On Windows, ensure tools are on the `cmd.exe` PATH. |
+| **Burp port not detected** | **Proxy → Proxy settings**: listener enabled, correct interface/port. |
+| **HTTPS still fails in apps** | Confirm Prepare log shows **VERIFY OK** for APEX Conscrypt paths where applicable; re-run Prepare. Consider pinning / custom TLS. |
+| **frida-server download fails** | Corporate proxy / TLS: requests go through Burp’s stack — check Burp **Network** settings. GitHub may redirect (302); the extension follows redirects. |
+| **Windows** | Expect manual `frida-server` steps; use WSL or Unix for parity with the automated path. |
+
+---
+
+## License and related files
+
+- **License:** [LICENSE](LICENSE)
+- **BApp submission notes:** [BAPP_SUBMISSION.md](BAPP_SUBMISSION.md)
+- **Email template for PortSwigger:** [SUBMIT_PORTSWIGGER.md](SUBMIT_PORTSWIGGER.md)
+
+---
+
+*Extension name in Burp UI: **Android Pentest** · Package: `com.mobilepentest.burp` · Artifact: `android-pentest-extension-1.0.0.jar`*
