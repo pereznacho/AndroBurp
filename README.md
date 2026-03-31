@@ -303,9 +303,6 @@ Set **APK to install** (or browse) to run **`adb install -r`** after the pipelin
 ## License and related files
 
 - **License:** [LICENSE](LICENSE)
-- **BApp submission notes:** [BAPP_SUBMISSION.md](BAPP_SUBMISSION.md)
-- **Email template for PortSwigger:** [SUBMIT_PORTSWIGGER.md](SUBMIT_PORTSWIGGER.md)
-
 ---
 
 *Extension name in Burp UI: **Android Pentest** · Package: `com.mobilepentest.burp` · Artifact: `android-pentest-extension-1.0.0.jar`*
